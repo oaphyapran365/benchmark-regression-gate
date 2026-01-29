@@ -1,10 +1,22 @@
 name: Perf Gate (CPU)
 
+
 on:
   push:
     branches: [main]
+    paths:
+      - "bench/**"
+      - "tools/**"
+      - "requirements.txt"
+      - ".github/workflows/**"
   pull_request:
+    paths:
+      - "bench/**"
+      - "tools/**"
+      - "requirements.txt"
+      - ".github/workflows/**"
   workflow_dispatch:
+
 
 concurrency:
   group: perf-gate-${{ github.event.pull_request.number || github.ref }}
