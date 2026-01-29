@@ -1,3 +1,4 @@
 pytest>=7.0
 pytest-benchmark>=4.0
 torch
+numpy==2.1.3
