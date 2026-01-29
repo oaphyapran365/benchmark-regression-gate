@@ -1,6 +1,8 @@
 name: Perf Gate (CPU)
 
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -10,16 +12,27 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   perf:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     env:
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
       OPENBLAS_NUM_THREADS: "1"
       NUMEXPR_NUM_THREADS: "1"
       PYTHONHASHSEED: "0"
+
+      BENCH_DIR: bench
+      CURRENT_JSON: bench/current.json
+      BASELINE_JSON: bench/baseline.json
+      REPORT_MD: bench/report.md
+
+      THRESHOLD: "0.07"
+      METRIC: "min"
 
     steps:
       - name: Checkout
@@ -29,34 +42,153 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install deps (CPU torch)
+      - name: Install deps (CPU-only)
+        shell: bash
         run: |
-          # CPU-only torch wheels for reproducible CI timing
-          taskset -c 0 pytest -q bench \
-            --benchmark-json=bench/current.json \
-            --benchmark-disable-gc \
-            --benchmark-warmup=on \
-            --benchmark-warmup-iterations=25 \
-            --benchmark-sort=name
+          set -euo pipefail
+          python -m pip install --upgrade pip
 
+          # Prefer repo requirements.txt if present
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          else
+            python -m pip install pytest pytest-benchmark numpy
+          fi
+
+          # CPU-only torch (only if you actually need torch in benches)
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+          python -m pytest --version
+
+      - name: Ensure bench directory
+        shell: bash
+        run: |
+          mkdir -p "${BENCH_DIR}"
+
+      # 1) Repo baseline check
+      - name: Check for repo baseline
+        id: repo_baseline
+        shell: bash
+        run: |
+          if [ -f "${BASELINE_JSON}" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Repo baseline found: ${BASELINE_JSON}"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No repo baseline at ${BASELINE_JSON}"
+          fi
+
+      # 2) If missing, try to download baseline artifact from the latest successful main run
+      - name: Download baseline artifact from main (if repo baseline missing)
+        if: steps.repo_baseline.outputs.found == 'false'
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # IMPORTANT: must match this workflow file name
+          workflow: perf-gate.yml
+          branch: main
+          name: perf-gate-cpu
+          path: .                 # download into repo root to avoid bench/bench nesting
+          if_no_artifact_found: ignore
+
+      - name: Verify baseline availability
+        id: baseline_ready
+        shell: bash
+        run: |
+          if [ -f "${BASELINE_JSON}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Baseline ready: ${BASELINE_JSON}"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Baseline not available."
+          fi
+
+      # Run benchmarks
       - name: Run benchmarks (CPU)
+        shell: bash
         run: |
-          pytest -q bench \
-            --benchmark-json=bench/current.json \
-            --benchmark-disable-gc \
-            --benchmark-warmup=on \
-            --benchmark-warmup-iterations=15 \
-            --benchmark-sort=name
+          set -euo pipefail
 
-      - name: Compare vs baseline (fail on regression > 7%)
+          if command -v taskset >/dev/null 2>&1; then
+            taskset -c 0 python -m pytest -q bench \
+              --benchmark-json="${CURRENT_JSON}" \
+              --benchmark-disable-gc \
+              --benchmark-warmup=on \
+              --benchmark-warmup-iterations=15 \
+              --benchmark-sort=name
+          else
+            python -m pytest -q bench \
+              --benchmark-json="${CURRENT_JSON}" \
+              --benchmark-disable-gc \
+              --benchmark-warmup=on \
+              --benchmark-warmup-iterations=15 \
+              --benchmark-sort=name
+          fi
+
+      # On push to main, refresh baseline artifact (treat current as baseline)
+      - name: Update baseline on main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
         run: |
+          set -euo pipefail
+          cp "${CURRENT_JSON}" "${BASELINE_JSON}"
+
+          cat > "${REPORT_MD}" <<EOF
+          # Performance Regression Report
+
+          **Status:** BASELINE UPDATED ✅  
+          **Metric:** \`${METRIC}\`  
+          **Threshold:** ${THRESHOLD}
+
+          This run is on **main**, so \`bench/current.json\` was promoted to the new baseline.
+          EOF
+
+      # On PRs, gate only if baseline exists; otherwise bootstrap (first-time setup)
+      - name: Compare vs baseline (FAIL on regression > threshold)
+        if: github.event_name != 'push' && steps.baseline_ready.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
           python tools/compare.py \
-            --baseline bench/baseline.json \
-            --current bench/current.json \
-            --threshold 0.07 \
-            --metric min \
-            --report bench/report.md
+            --baseline "${BASELINE_JSON}" \
+            --current "${CURRENT_JSON}" \
+            --threshold "${THRESHOLD}" \
+            --metric "${METRIC}" \
+            --report "${REPORT_MD}"
+
+      - name: Bootstrap baseline (no gate)
+        if: github.event_name != 'push' && steps.baseline_ready.outputs.ready == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${CURRENT_JSON}" "${BASELINE_JSON}"
+
+          cat > "${REPORT_MD}" <<'EOF'
+          # Performance Regression Report
+
+          **Status:** BASELINE BOOTSTRAPPED ✅  
+          No baseline was found in the repo (`bench/baseline.json`) or from the latest main artifact.
+          This run created a baseline from `bench/current.json`.
+
+          **Next:** merge a run on `main` (or commit `bench/baseline.json`) so PR gating is enabled.
+          EOF
+
+      - name: Publish Markdown summary to job
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Perf Gate (CPU)"
+            echo ""
+            echo "- Threshold: ${THRESHOLD}"
+            echo "- Metric: ${METRIC}"
+            echo ""
+            echo "### Report"
+            echo ""
+            cat "${REPORT_MD}" || true
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
         if: always()
