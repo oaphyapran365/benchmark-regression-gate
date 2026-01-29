@@ -1,0 +1,65 @@
+name: Perf Gate (CPU)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: perf-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      PYTHONHASHSEED: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch wheels for reproducible CI timing
+          pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run benchmarks (CPU)
+        run: |
+          pytest -q bench \
+            --benchmark-json=bench/current.json \
+            --benchmark-disable-gc \
+            --benchmark-warmup=on \
+            --benchmark-warmup-iterations=15 \
+            --benchmark-sort=name
+
+      - name: Compare vs baseline (fail on regression > 7%)
+        run: |
+          python tools/compare.py \
+            --baseline bench/baseline.json \
+            --current bench/current.json \
+            --threshold 0.07 \
+            --metric min \
+            --report bench/report.md
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-gate-cpu
+          path: |
+            bench/baseline.json
+            bench/current.json
+            bench/report.md

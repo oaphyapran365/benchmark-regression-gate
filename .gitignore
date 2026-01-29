@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# venv
+.venv/
+venv/
+
+# Pytest
+.pytest_cache/
+
+# Benchmark outputs (generated)
+bench/current.json
+bench/report.md
+
+# OS
+.DS_Store
