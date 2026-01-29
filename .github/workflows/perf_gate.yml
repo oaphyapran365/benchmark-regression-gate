@@ -32,11 +32,13 @@ jobs:
 
       - name: Install deps (CPU torch)
         run: |
-          python -m pip install --upgrade pip
           # CPU-only torch wheels for reproducible CI timing
-          pip install pytest pytest-benchmark numpy
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-
+          taskset -c 0 pytest -q bench \
+            --benchmark-json=bench/current.json \
+            --benchmark-disable-gc \
+            --benchmark-warmup=on \
+            --benchmark-warmup-iterations=25 \
+            --benchmark-sort=name
 
       - name: Run benchmarks (CPU)
         run: |
